@@ -2,9 +2,13 @@ import os
 import json
 import csv
 import time
+import urllib3
 import requests
 from bs4 import BeautifulSoup
 from openai import OpenAI
+
+# 忽略 SSL 警告（解决浙江大学证书过期的问题）
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN")
 
@@ -21,14 +25,23 @@ HEADERS = {
     )
 }
 
+# 固定的字段名，防止大模型乱加字段导致写入崩溃
+FIELDNAMES = ["学校", "年份", "标题", "发布时间", "报名时间", "初试时间", "招生专业", "学费", "原文链接"]
+
 def fetch(url):
-    r = requests.get(url, headers=HEADERS, timeout=25)
+    # 添加 verify=False 忽略 HTTPS 证书校验
+    r = requests.get(url, headers=HEADERS, timeout=25, verify=False)
     r.raise_for_status()
     r.encoding = r.apparent_encoding
     return r.text
 
 def find_admission_links(school):
-    html = fetch(school["url"])
+    try:
+        html = fetch(school["url"])
+    except Exception as e:
+        print(f"访问学校主页失败 {school['name']}: {e}")
+        return []
+        
     soup = BeautifulSoup(html, "lxml")
     keywords = ["招生简章", "招生章程", "硕士招生", "博士招生", "招生信息"]
     links = []
@@ -73,49 +86,68 @@ def extract_with_llm(text, url):
 def push_wechat(title, content):
     if not PUSHPLUS_TOKEN:
         return
-    requests.post(
-        "https://www.pushplus.plus/send",
-        json={
-            "token": PUSHPLUS_TOKEN,
-            "title": title,
-            "content": content,
-            "template": "html",
-        },
-        timeout=20,
-    )
+    try:
+        requests.post(
+            "https://www.pushplus.plus/send",
+            json={
+                "token": PUSHPLUS_TOKEN,
+                "title": title,
+                "content": content,
+                "template": "html",
+            },
+            timeout=20,
+        )
+    except Exception as e:
+        print("推送失败", e)
 
 def main():
-    schools = json.load(open("schools.json", encoding="utf-8"))
+    try:
+        schools = json.load(open("schools.json", encoding="utf-8"))
+    except Exception as e:
+        print("读取 schools.json 失败", e)
+        return
+
     rows = []
     for school in schools:
-        try:
-            links = find_admission_links(school)
-            print(school["name"], "找到", len(links), "个链接")
-            for link in links:
-                try:
-                    detail_html = fetch(link["url"])
-                    detail_text = BeautifulSoup(detail_html, "lxml").get_text("\n")
-                    data = extract_with_llm(detail_text, link["url"])
-                    data["学校"] = school["name"]
-                    rows.append(data)
-                    time.sleep(3)
-                except Exception as e:
-                    print("详情失败", link["url"], e)
-        except Exception as e:
-            print("学校失败", school["name"], e)
+        print(f"开始处理: {school['name']}")
+        links = find_admission_links(school)
+        print(f"{school['name']} 找到 {len(links)} 个链接")
+        
+        for link in links:
+            try:
+                detail_html = fetch(link["url"])
+                detail_text = BeautifulSoup(detail_html, "lxml").get_text("\n")
+                data = extract_with_llm(detail_text, link["url"])
+                data["学校"] = school["name"]
+                rows.append(data)
+                time.sleep(3)
+            except Exception as e:
+                print(f"详情解析失败 {link['url']}: {e}")
+                continue
 
-    if rows:
-        keys = rows[0].keys()
+    # 清洗数据，强制对齐字段
+    cleaned_rows = []
+    for row in rows:
+        cleaned = {k: row.get(k, "") for k in FIELDNAMES}
+        cleaned_rows.append(cleaned)
+
+    if cleaned_rows:
         with open("result.csv", "w", newline="", encoding="utf-8-sig") as f:
-            writer = csv.DictWriter(f, fieldnames=keys)
+            writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
             writer.writeheader()
-            writer.writerows(rows)
+            writer.writerows(cleaned_rows)
+        print("CSV 写入完成")
 
     lines = []
-    for r in rows[:20]:
+    for r in cleaned_rows[:20]:
         lines.append(f"{r.get('学校','')} | {r.get('标题','')} | {r.get('报名时间','')} | {r.get('原文链接','')}")
-    content = f"共抓到 {len(rows)} 条。<br>前 20 条：<br>" + "<br>".join(lines)
-    push_wechat("双一流研招简章更新", content)
+    
+    if lines:
+        content = f"共抓到 {len(cleaned_rows)} 条。<br>前 20 条：<br>" + "<br>".join(lines)
+        push_wechat("双一流研招简章更新", content)
+        print("推送完成")
+    else:
+        print("没有抓到任何数据，跳过推送")
 
 if __name__ == "__main__":
     main()
